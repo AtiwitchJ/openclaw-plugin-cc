@@ -20,6 +20,12 @@ import {
   runOpenClaw
 } from "./lib/openclaw.mjs";
 import {
+  collectReviewContext,
+  ensureGitRepository,
+  resolveReviewTarget
+} from "./lib/git.mjs";
+import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import {
   generateJobId,
   listJobs,
   upsertJob,
@@ -43,10 +49,12 @@ import {
 import {
   renderCancelReport,
   renderJobStatusReport,
+  renderReviewResult,
   renderStatusReport,
   renderStoredJobResult,
   renderSetupReport,
-  renderTaskResult
+  renderTaskResult,
+  renderTransferResult
 } from "./lib/render.mjs";
 import {
   createDelegateLogFile,
@@ -145,7 +153,10 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/openclaw-companion.mjs setup [--json]",
+      "  node scripts/openclaw-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/openclaw-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/openclaw-companion.mjs task [--background] [--delegate-to=<agent>] [--resume] [--agent <name>] [--prompt=<text>] [--timeout=<ms>] [prompt]",
+      "  node scripts/openclaw-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/openclaw-companion.mjs status [job-id] [--json]",
       "  node scripts/openclaw-companion.mjs result [job-id] [--json]",
       "  node scripts/openclaw-companion.mjs cancel [job-id] [--json]",
@@ -265,6 +276,76 @@ async function executeTaskRun({ cwd, prompt, resume, agent, onProgress, logFile 
   };
 }
 
+function buildReviewPrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
+  return interpolateTemplate(template, {
+    REVIEW_KIND: "Adversarial Review",
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content
+  });
+}
+
+function buildNativeReviewPrompt(context) {
+  return [
+    "You are running in read-only review mode. Do not modify any files.",
+    `Review target: ${context.target.label}`,
+    "Repository context:",
+    context.summary,
+    "",
+    "Provide a thorough code review of the changes. Return your findings as Markdown.",
+    "",
+    "Diff:",
+    context.content
+  ].join("\n");
+}
+
+async function executeReviewRun({ cwd, base, scope, focusText, agent, reviewName, onProgress, logFile }) {
+  ensureOpenclawAvailable();
+  ensureGitRepository(cwd);
+
+  const target = resolveReviewTarget(cwd, { base, scope });
+  const context = collectReviewContext(cwd, target);
+
+  const prompt =
+    reviewName === "Adversarial Review"
+      ? buildReviewPrompt(context, focusText)
+      : buildNativeReviewPrompt(context);
+
+  const result = await runOpenClaw(cwd, {
+    prompt,
+    agent: agent ?? null,
+    onProgress,
+    logFile,
+    json: false
+  });
+
+  return {
+    exitStatus: result.status,
+    sessionId: result.sessionId,
+    payload: {
+      review: reviewName,
+      target,
+      openclaw: {
+        status: result.status,
+        stderr: result.stderr,
+        text: result.text,
+        error: result.error
+      }
+    },
+    rendered: renderReviewResult(result.text, {
+      reviewLabel: reviewName,
+      targetLabel: target.label,
+      sessionId: result.sessionId,
+      agentName: "OpenClaw"
+    }),
+    summary: firstMeaningfulLine(result.text, `${reviewName} finished.`),
+    jobTitle: `OpenClaw ${reviewName}`,
+    jobClass: "review"
+  };
+}
+
 async function runForegroundCommand(job, runner, options = {}) {
   const logFile = options.logFile ?? createJobLogFile(job.workspaceRoot, job.id, job.title);
   job.logFile = logFile;
@@ -333,6 +414,114 @@ async function handleTask(argv) {
         logFile: job.logFile
       }),
     { json: options.json }
+  );
+}
+
+async function handleReviewCommand(argv, config) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "agent", "cwd"],
+    booleanOptions: ["json", "background", "wait"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const focusText = positionals.join(" ").trim();
+
+  const job = createJobRecord({
+    id: generateJobId("review"),
+    kind: config.kind,
+    kindLabel: config.kind,
+    title: `OpenClaw ${config.reviewName}`,
+    workspaceRoot,
+    jobClass: "review",
+    summary: config.reviewName,
+    write: false
+  });
+
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeReviewRun({
+        cwd,
+        base: options.base,
+        scope: options.scope,
+        focusText,
+        agent: options.agent ?? null,
+        reviewName: config.reviewName,
+        onProgress: progress,
+        logFile: job.logFile
+      }),
+    { json: options.json }
+  );
+}
+
+async function handleReview(argv) {
+  return handleReviewCommand(argv, { reviewName: "Review", kind: "review" });
+}
+
+async function handleAdversarialReview(argv) {
+  return handleReviewCommand(argv, { reviewName: "Adversarial Review", kind: "adversarial-review" });
+}
+
+function resolveClaudeSessionPath(cwd) {
+  const claudeProjects = path.join(process.env.USERPROFILE ?? process.env.HOME ?? "", ".claude", "projects");
+  if (!fs.existsSync(claudeProjects)) {
+    throw new Error("No ~/.claude/projects directory found.");
+  }
+  const entries = fs
+    .readdirSync(claudeProjects, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => ({
+      path: path.join(claudeProjects, entry.name),
+      mtime: fs.statSync(path.join(claudeProjects, entry.name)).mtimeMs
+    }))
+    .sort((a, b) => b.mtime - a.mtime);
+  if (entries.length === 0) {
+    throw new Error("No Claude session directories found under ~/.claude/projects.");
+  }
+  const files = fs
+    .readdirSync(entries[0].path)
+    .filter((name) => name.endsWith(".jsonl"))
+    .map((name) => ({
+      path: path.join(entries[0].path, name),
+      mtime: fs.statSync(path.join(entries[0].path, name)).mtimeMs
+    }))
+    .sort((a, b) => b.mtime - a.mtime);
+  if (files.length === 0) {
+    throw new Error("No .jsonl Claude session transcripts found.");
+  }
+  return files[0].path;
+}
+
+async function handleTransfer(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "source"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const sourcePath = options.source
+    ? path.resolve(cwd, options.source)
+    : resolveClaudeSessionPath(cwd);
+
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`Claude session not found at ${sourcePath}.`);
+  }
+
+  const result = await runOpenClaw(cwd, {
+    prompt: `Import this Claude Code session as a resumable OpenClaw session and reply with a one-line acknowledgement. Source: ${sourcePath}`
+  });
+
+  const sessionId = result.sessionId ?? "unknown";
+  const resumeCommand = `openclaw agent --local --session-id ${sessionId}`;
+
+  const payload = { sessionId, resumeCommand, sourcePath };
+
+  outputResult(
+    options.json
+      ? payload
+      : `${renderTransferResult({ threadId: sessionId, resumeCommand, agentName: "OpenClaw" }).trimEnd()}\n- Source: \`${sourcePath}\`\n`,
+    options.json
   );
 }
 
@@ -405,8 +594,17 @@ async function main() {
     case "setup":
       await handleSetup(argv);
       break;
+    case "review":
+      await handleReview(argv);
+      break;
+    case "adversarial-review":
+      await handleAdversarialReview(argv);
+      break;
     case "task":
       await handleTask(argv);
+      break;
+    case "transfer":
+      await handleTransfer(argv);
       break;
     case "status":
       await handleStatus(argv);

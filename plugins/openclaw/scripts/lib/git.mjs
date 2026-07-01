@@ -91,6 +91,22 @@ export function resolveReviewTarget(cwd, options = {}) {
   return { mode: "working-tree", label: "current uncommitted changes" };
 }
 
+export function ensureGitRepository(cwd) {
+  if (!isGitRepository(cwd)) {
+    throw new Error("This command must be run from inside a git repository.");
+  }
+}
+
+function isGitRepository(cwd) {
+  try {
+    return fs.existsSync(path.join(resolveWorkspaceRoot(cwd), ".git"));
+  } catch {
+    return false;
+  }
+}
+
+export { isGitRepository };
+
 /**
  * Build a textual review context (file list + diff snippets) for LLM consumption.
  * Used by adversarial reviews where kilo needs the actual diff as part of the prompt.
