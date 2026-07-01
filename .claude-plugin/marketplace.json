@@ -1,0 +1,17 @@
+{
+  "name": "agents-plugin-cc-openclaw",
+  "owner": { "name": "agents-plugin-cc" },
+  "metadata": {
+    "description": "Claude Code plugin for delegating work to OpenClaw.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "openclaw",
+      "description": "Use OpenClaw from Claude Code to review code or delegate tasks.",
+      "version": "0.1.0",
+      "author": { "name": "agents-plugin-cc" },
+      "source": "./plugins/openclaw"
+    }
+  ]
+}

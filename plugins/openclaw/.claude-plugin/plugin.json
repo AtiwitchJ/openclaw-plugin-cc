@@ -1,0 +1,6 @@
+{
+  "name": "openclaw",
+  "version": "0.1.0",
+  "description": "Use OpenClaw from Claude Code to review code or delegate tasks.",
+  "author": { "name": "agents-plugin-cc" }
+}
