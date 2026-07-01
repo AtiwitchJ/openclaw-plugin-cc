@@ -1,40 +1,378 @@
 #!/usr/bin/env node
 /**
- * openclaw-companion - dispatcher stub for the OpenClaw plugin.
+ * openclaw-companion - dispatcher for the OpenClaw plugin.
  *
- * Implementation plan (copy from kilo-plugin-cc/plugins/kilo/scripts/kilo-companion.mjs):
- *   - swap `import "./lib/kilo.mjs"` for `import "./lib/openclaw.mjs"`
- *   - swap `runKilo`/`getKiloAvailability`/`getKiloAuthStatus` calls for their
- *     `runOpenClaw`/`getOpenClawAvailability`/`getOpenClawAuthStatus` equivalents
- *   - the CLI binary is `openclaw`
+ * Mirrors claude-companion.mjs but invokes `openclaw agent --local --message ...`.
+ * Supports cross-agent delegation via `--delegate-to=<agent>`.
  */
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import {
+  ensureOpenclawAvailable,
+  findLatestResumableSession,
+  getOpenClawAuthStatus,
+  getOpenClawAvailability,
+  runOpenClaw
+} from "./lib/openclaw.mjs";
+import {
+  generateJobId,
+  listJobs,
+  upsertJob,
+  writeJobFile
+} from "./lib/state.mjs";
+import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import {
+  buildSingleJobSnapshot,
+  buildStatusSnapshot,
+  readStoredJob,
+  resolveResultJob
+} from "./lib/job-control.mjs";
+import {
+  appendLogLine,
+  createJobLogFile,
+  createJobProgressUpdater,
+  createJobRecord,
+  createProgressReporter,
+  runTrackedJob
+} from "./lib/tracked-jobs.mjs";
+import {
+  renderCancelReport,
+  renderJobStatusReport,
+  renderStatusReport,
+  renderStoredJobResult,
+  renderSetupReport,
+  renderTaskResult
+} from "./lib/render.mjs";
+
+const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+
+const KNOWN_COMPANIONS = {
+  kilo: "kilo-plugin-cc",
+  claude: "claude-plugin-cc",
+  openclaw: "openclaw-plugin-cc"
+};
+
+function resolveCompanionScript(agent) {
+  const repo = KNOWN_COMPANIONS[agent];
+  if (!repo) {
+    throw new Error(`Unknown agent "${agent}". Known: ${Object.keys(KNOWN_COMPANIONS).join(", ")}`);
+  }
+  const candidates = [
+    path.join("D:\\mind", repo, "plugins", agent, "scripts", `${agent}-companion.mjs`),
+    path.join(process.cwd(), "..", repo, "plugins", agent, "scripts", `${agent}-companion.mjs`),
+    path.resolve(ROOT_DIR, "..", "..", "..", "..", repo, "plugins", agent, "scripts", `${agent}-companion.mjs`)
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `Could not find ${agent}-companion.mjs. Tried:\n  ${candidates.join("\n  ")}`
+  );
+}
+
+function delegateToAgent(agent, argv) {
+  const script = resolveCompanionScript(agent);
+  const quoted = argv
+    .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+    .join(" ");
+  const result = spawnSync(process.execPath, [script, ...argv], {
+    stdio: "inherit",
+    env: process.env,
+    cwd: process.cwd()
+  });
+  if (typeof result.status === "number") process.exit(result.status);
+  process.exit(result.error ? 1 : 0);
+}
 
 function printUsage() {
   console.log(
     [
       "Usage:",
       "  node scripts/openclaw-companion.mjs setup [--json]",
-      "  node scripts/openclaw-companion.mjs review [--wait|--background] [--base <ref>]",
-      "  node scripts/openclaw-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [focus text]",
-      "  node scripts/openclaw-companion.mjs task [--background] [--write] [--resume|--fresh] [prompt]",
+      "  node scripts/openclaw-companion.mjs task [--background] [--delegate-to=<agent>] [--resume] [--agent <name>] [prompt]",
       "  node scripts/openclaw-companion.mjs status [job-id] [--json]",
       "  node scripts/openclaw-companion.mjs result [job-id] [--json]",
-      "  node scripts/openclaw-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/openclaw-companion.mjs cancel [job-id] [--json]",
+      `Known agents for --delegate-to: ${Object.keys(KNOWN_COMPANIONS).join(", ")}`
     ].join("\n")
   );
 }
 
+function outputResult(value, asJson) {
+  if (asJson) {
+    console.log(JSON.stringify(value, null, 2));
+  } else {
+    process.stdout.write(typeof value === "string" ? value : `${value}\n`);
+  }
+}
+
+function normalizeArgv(argv) {
+  if (argv.length === 1) return splitRawArgumentString(argv[0] ?? "");
+  return argv;
+}
+
+function parseCommandInput(argv, config = {}) {
+  return parseArgs(normalizeArgv(argv), { ...config });
+}
+
+function resolveCommandCwd(options = {}) {
+  return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+}
+
+function firstMeaningfulLine(text, fallback) {
+  const line = String(text ?? "")
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .find(Boolean);
+  return line ?? fallback;
+}
+
+async function handleSetup(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const openclawStatus = getOpenClawAvailability(cwd);
+  const authStatus = await getOpenClawAuthStatus(cwd);
+  const { getConfig } = await import("./lib/state.mjs");
+  const config = getConfig(workspaceRoot);
+
+  const nextSteps = [];
+  if (!openclawStatus.available) {
+    nextSteps.push("Install OpenClaw with `npm install -g openclaw@latest`.");
+  }
+  if (openclawStatus.available && !authStatus.loggedIn) {
+    nextSteps.push("Run `openclaw onboard --install-daemon` to finish setup.");
+  }
+
+  const report = {
+    ready: openclawStatus.available && authStatus.loggedIn,
+    openclaw: openclawStatus,
+    auth: authStatus,
+    workspaceRoot,
+    config,
+    nextSteps
+  };
+  outputResult(options.json ? report : renderSetupReport({ ...report, kilo: openclawStatus, auth: authStatus, workspaceRoot, nextSteps }), options.json);
+}
+
+async function executeTaskRun({ cwd, prompt, resume, agent, onProgress, logFile }) {
+  ensureOpenclawAvailable();
+
+  let sessionId = null;
+  let effectiveResume = Boolean(resume);
+  if (effectiveResume) {
+    const latest = await findLatestResumableSession(cwd);
+    if (!latest) {
+      throw new Error("No previous OpenClaw session was found for this repository.");
+    }
+    sessionId = latest.id;
+  }
+
+  if (!prompt && !sessionId) {
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume.");
+  }
+
+  const result = await runOpenClaw(cwd, {
+    prompt,
+    agent: agent ?? null,
+    sessionId,
+    onProgress,
+    logFile,
+    json: false
+  });
+
+  const failureMessage = result.error ?? result.stderr ?? "";
+  const rendered = renderTaskResult(
+    { text: result.text, failureMessage, reasoningSummary: [] },
+    { title: effectiveResume ? "OpenClaw Resume" : "OpenClaw Task", jobId: null, write: false }
+  );
+
+  return {
+    exitStatus: result.status,
+    sessionId: result.sessionId ?? sessionId,
+    payload: {
+      status: result.status,
+      sessionId: result.sessionId ?? sessionId,
+      text: result.text,
+      stderr: result.stderr,
+      error: result.error,
+      resumed: effectiveResume
+    },
+    rendered,
+    summary: firstMeaningfulLine(result.text, firstMeaningfulLine(failureMessage, "OpenClaw task finished.")),
+    jobTitle: effectiveResume ? "OpenClaw Resume" : "OpenClaw Task",
+    jobClass: "task",
+    write: false
+  };
+}
+
+async function runForegroundCommand(job, runner, options = {}) {
+  const logFile = options.logFile ?? createJobLogFile(job.workspaceRoot, job.id, job.title);
+  job.logFile = logFile;
+  const progress = createProgressReporter({
+    stderr: !options.json,
+    logFile,
+    onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
+  });
+  const execution = await runTrackedJob({ ...job, logFile }, () => runner(progress), { logFile });
+  outputResult(options.json ? execution.payload : execution.rendered, options.json);
+  if (execution.exitStatus !== 0) process.exitCode = execution.exitStatus || 1;
+  return execution;
+}
+
+async function handleTask(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "prompt-file", "delegate-to", "agent"],
+    booleanOptions: ["json", "resume", "fresh", "background"]
+  });
+
+  if (options["delegate-to"]) {
+    const agent = String(options["delegate-to"]);
+    const subcommand = process.argv[2];
+    const remaining = process.argv.slice(3).filter((arg) => !arg.startsWith("--delegate-to=") && arg !== "--delegate-to");
+    delegateToAgent(agent, [subcommand, ...remaining]);
+    return;
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const resume = Boolean(options.resume);
+  const fresh = Boolean(options.fresh);
+  if (resume && fresh) {
+    throw new Error("Choose either --resume or --fresh.");
+  }
+
+  const prompt = (() => {
+    if (options["prompt-file"]) {
+      return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+    }
+    const positionalPrompt = positionals.join(" ");
+    return positionalPrompt || (fs.readFileSync(0, "utf8") || "").trim();
+  })();
+
+  const job = createJobRecord({
+    id: generateJobId("task"),
+    kind: "task",
+    kindLabel: "task",
+    title: resume ? "OpenClaw Resume" : "OpenClaw Task",
+    workspaceRoot,
+    jobClass: "task",
+    summary: firstMeaningfulLine(prompt, "Task"),
+    write: false,
+    request: { cwd, prompt, resume, agent: options.agent ?? null }
+  });
+
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeTaskRun({
+        cwd,
+        prompt,
+        resume,
+        agent: options.agent ?? null,
+        onProgress: progress,
+        logFile: job.logFile
+      }),
+    { json: options.json }
+  );
+}
+
+async function handleStatus(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "all"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  if (reference) {
+    const snapshot = buildSingleJobSnapshot(cwd, reference);
+    outputResult(options.json ? snapshot : renderJobStatusReport(snapshot.job), options.json);
+    return;
+  }
+  const report = buildStatusSnapshot(cwd, { all: options.all });
+  outputResult(options.json ? report : renderStatusReport(report), options.json);
+}
+
+function handleResult(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  outputResult(options.json ? { job, storedJob } : renderStoredJobResult(job, storedJob), options.json);
+}
+
+async function handleCancel(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  appendLogLine(job.logFile, "Cancelled by user.");
+  const completedAt = new Date().toISOString();
+  const nextJob = {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    completedAt,
+    errorMessage: "Cancelled by user."
+  };
+  writeJobFile(workspaceRoot, job.id, { ...(readStoredJob(workspaceRoot, job.id) ?? {}), ...nextJob, cancelledAt: completedAt });
+  upsertJob(workspaceRoot, {
+    id: job.id,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: "Cancelled by user.",
+    completedAt
+  });
+  const payload = { jobId: job.id, status: "cancelled", title: job.title };
+  outputResult(options.json ? payload : renderCancelReport(nextJob), options.json);
+}
+
 async function main() {
-  const [subcommand] = process.argv.slice(2);
+  const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
     return;
   }
-  process.stderr.write(
-    "`openclaw-companion` is a stub. See ../../../kilo-plugin-cc/plugins/kilo/scripts/kilo-companion.mjs for a complete reference implementation. The CLI binary is `openclaw`.\n"
-  );
-  process.exitCode = 1;
+  switch (subcommand) {
+    case "setup":
+      await handleSetup(argv);
+      break;
+    case "task":
+      await handleTask(argv);
+      break;
+    case "status":
+      await handleStatus(argv);
+      break;
+    case "result":
+      handleResult(argv);
+      break;
+    case "cancel":
+      await handleCancel(argv);
+      break;
+    default:
+      throw new Error(`Unknown subcommand: ${subcommand}`);
+  }
 }
 
-main();
+main().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${message}\n`);
+  process.exitCode = 1;
+});
