@@ -54,7 +54,12 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const KNOWN_COMPANIONS = {
   kilo: "kilo-plugin-cc",
   claude: "claude-plugin-cc",
-  openclaw: "openclaw-plugin-cc"
+  openclaw: "openclaw-plugin-cc",
+  opencode: "opencode-plugin-cc",
+  antigravity: "antigravity-plugin-cc",
+  cursor: "cursor-plugin-cc",
+  hermes: "hermes-plugin-cc",
+  jules: "jules-plugin-cc"
 };
 
 function resolveCompanionScript(agent) {
