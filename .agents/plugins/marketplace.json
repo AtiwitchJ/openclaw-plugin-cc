@@ -1,0 +1,20 @@
+{
+  "name": "agents-plugin-cc-openclaw",
+  "interface": {
+    "displayName": "OpenClaw Plugin"
+  },
+  "plugins": [
+    {
+      "name": "openclaw",
+      "source": {
+        "source": "local",
+        "path": "./plugins/openclaw"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
