@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { runCommand, binaryAvailable } from "./process.mjs";
+import { buildWindowsShellCommandLine } from "./win-quote.mjs";
 
 const OPENCLAW_BINARY = "openclaw";
 const OPENCLAW_CONFIG_DIR = process.env.OPENCLAW_CONFIG_DIR ?? path.join(os.homedir(), ".openclaw");
@@ -18,13 +19,27 @@ function cleanOpenclawStderr(stderr) {
 
 function spawnOpenclaw({ cwd, args, onProgress, logFile }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(OPENCLAW_BINARY, args, {
-      cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      shell: process.platform === "win32"
-    });
+    // openclaw only ships as a .cmd/.ps1 shim on Windows, so it must go
+    // through a shell to be found at all. Node's own shell:true + array-args
+    // quoting naively concatenates without escaping (DEP0190), which
+    // corrupts any multi-word prompt. Build the command line ourselves with
+    // proper cmd.exe-safe quoting instead of handing Node a raw args array.
+    const useWindowsShell = process.platform === "win32";
+    const child = useWindowsShell
+      ? spawn(buildWindowsShellCommandLine(OPENCLAW_BINARY, args), {
+          cwd,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          shell: true
+        })
+      : spawn(OPENCLAW_BINARY, args, {
+          cwd,
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          shell: false
+        });
 
     let stdout = "";
     let stderr = "";
