@@ -1,6 +1,6 @@
-# OpenClaw plugin for Claude Code
+# OpenClaw plugin for Claude Code and Codex
 
-This plugin is for Claude Code users who want to delegate code reviews or tasks to the
+This plugin is for Claude Code and Codex users who want to delegate code reviews or tasks to the
 **OpenClaw CLI** ([docs.openclaw.ai](https://docs.openclaw.ai/)) — a self-hosted multi-channel
 gateway that runs AI agents and bridges them to chat apps (Telegram, Discord, WhatsApp, etc.).
 
@@ -9,7 +9,7 @@ gateway that runs AI agents and bridges them to chat apps (Telegram, Discord, Wh
 - `/openclaw:review` for a normal read-only review
 - `/openclaw:adversarial-review` for a steerable challenge review
 - `/openclaw:rescue` to delegate investigation, a fix request, or follow-up work (runs `task`)
-- `/openclaw:transfer` to import the current Claude Code session as a resumable OpenClaw session
+- `/openclaw:transfer` to import the current Claude Code or Codex session as a resumable OpenClaw session
 - `/openclaw:status`, `/openclaw:result`, and `/openclaw:cancel` to track background jobs
 - `/openclaw:setup` to verify the CLI and authentication
 
